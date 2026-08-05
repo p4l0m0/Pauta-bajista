@@ -1,0 +1,316 @@
+# ==========================================================================
+#  ANALIZADOR "PAUTA DE TECHO CORTO" (metodología José Luis Cava)
+#  Copiar y pegar en UNA celda de Google Colab y ejecutar (Shift + Enter)
+# ==========================================================================
+
+!pip install -q yfinance plotly pandas ipywidgets
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import plotly.graph_objects as go
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+
+try:
+    from google.colab import output as _colab_output
+    _colab_output.enable_custom_widget_manager()
+except Exception:
+    pass
+
+# --------------------------------------------------------------------------
+# PARÁMETROS AJUSTABLES
+# --------------------------------------------------------------------------
+LEFT = RIGHT = 3            # barras a izquierda/derecha para validar un pivote
+TOL_DOBLE_TECHO = 0.020     # 2% de diferencia máxima entre los dos picos
+TOL_RESISTENCIA = 0.030     # 3% para considerar testeo/dilatación de resistencia
+SEP_MIN_PICOS = 5           # separación mínima en barras entre los dos picos
+BARRAS_LATERAL = 10         # barras que se miran para la consolidación plana
+FACTOR_ATR_LATERAL = 2.0    # rango máximo del lateral en múltiplos de ATR
+PROX_EMA = 0.015            # 1.5% de proximidad del precio a las EMAs
+MARGEN_STOP_ATR = 0.5       # stop = máximo + 0.5 * ATR
+
+
+# --------------------------------------------------------------------------
+# FUNCIONES AUXILIARES
+# --------------------------------------------------------------------------
+def descargar(ticker, intervalo):
+    periodo = "2y" if intervalo == "1d" else "180d"
+    df = yf.Ticker(ticker).history(period=periodo, interval=intervalo)
+    if df is None or df.empty:
+        return None
+    cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+    df = df[cols].dropna()
+    if intervalo == "1d":
+        df = df.tail(400)
+    else:
+        df = df.tail(500)
+    return df.reset_index(drop=False).rename(columns={df.index.name or "index": "Fecha"})
+
+
+def calcular_atr(df, n=14):
+    hl = df["High"] - df["Low"]
+    hc = (df["High"] - df["Close"].shift()).abs()
+    lc = (df["Low"] - df["Close"].shift()).abs()
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    return tr.rolling(n).mean()
+
+
+def encontrar_pivotes(serie, left=LEFT, right=RIGHT, tipo="max"):
+    v = serie.values
+    idx = []
+    for i in range(left, len(v) - right):
+        vent = v[i - left:i + right + 1]
+        if tipo == "max" and v[i] == vent.max() and v[i] >= v[i - 1]:
+            idx.append(i)
+        elif tipo == "min" and v[i] == vent.min() and v[i] <= v[i - 1]:
+            idx.append(i)
+    return idx
+
+
+def recta(x1, y1, x2, y2, x):
+    if x2 == x1:
+        return y1
+    m = (y2 - y1) / (x2 - x1)
+    return y1 + m * (x - x1)
+
+
+# --------------------------------------------------------------------------
+# MOTOR DE ANÁLISIS
+# --------------------------------------------------------------------------
+def analizar(df):
+    res = {"c1": False, "c2": False, "c3": False, "detalle": {}, "lineas": {}}
+
+    df["EMA21"] = df["Close"].ewm(span=21, adjust=False).mean()
+    df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
+    df["ATR"] = calcular_atr(df)
+
+    n = len(df)
+    ultimo = n - 1
+    atr = float(df["ATR"].iloc[-1]) if not np.isnan(df["ATR"].iloc[-1]) else float(df["Close"].iloc[-1]) * 0.01
+    cierre = float(df["Close"].iloc[-1])
+
+    piv_max = encontrar_pivotes(df["High"], tipo="max")
+    piv_min = encontrar_pivotes(df["Low"], tipo="min")
+
+    # ---------------- CIRCUNSTANCIA 2: doble techo + valle + directriz -----
+    picos_recientes = [i for i in piv_max if i > n - 150]
+    pico1 = pico2 = None
+    for a in range(len(picos_recientes) - 1, 0, -1):
+        i2 = picos_recientes[a]
+        for b in range(a - 1, -1, -1):
+            i1 = picos_recientes[b]
+            if i2 - i1 < SEP_MIN_PICOS:
+                continue
+            p1, p2 = df["High"].iloc[i1], df["High"].iloc[i2]
+            if abs(p2 - p1) / p1 <= TOL_DOBLE_TECHO:
+                pico1, pico2 = i1, i2
+                break
+        if pico1 is not None:
+            break
+
+    valle_roto = directriz_rota = False
+    valle_val = None
+    if pico1 is not None:
+        tramo = df["Low"].iloc[pico1:pico2 + 1]
+        valle_val = float(tramo.min())
+        idx_valle = int(tramo.idxmin())
+        post = df["Close"].iloc[pico2 + 1:]
+        valle_roto = bool((post < valle_val).any()) if len(post) else False
+
+        minimos_previos = [i for i in piv_min if i < pico2]
+        if len(minimos_previos) >= 2:
+            m1, m2 = minimos_previos[-2], minimos_previos[-1]
+            y1, y2 = float(df["Low"].iloc[m1]), float(df["Low"].iloc[m2])
+            if y2 > y1:  # directriz alcista válida
+                for j in range(pico2 + 1, n):
+                    if df["Close"].iloc[j] < recta(m1, y1, m2, y2, j):
+                        directriz_rota = True
+                        break
+                res["lineas"]["directriz"] = (m1, y1, m2, y2)
+
+        res["lineas"]["valle"] = (idx_valle, valle_val)
+        res["lineas"]["picos"] = (pico1, float(df["High"].iloc[pico1]),
+                                  pico2, float(df["High"].iloc[pico2]))
+
+    res["c2"] = bool(pico1 is not None and valle_roto and directriz_rota)
+    res["detalle"]["c2"] = (
+        f"Doble techo: {'sí' if pico1 is not None else 'no detectado'} | "
+        f"Valle perforado: {'sí' if valle_roto else 'no'} | "
+        f"Directriz alcista perforada: {'sí' if directriz_rota else 'no'}"
+    )
+
+    # ---------------- CIRCUNSTANCIA 1: tendencia previa + resistencia ------
+    ref = pico1 if pico1 is not None else max(0, n - 30)
+    ini = max(0, ref - 60)
+    tendencia_alcista = False
+    if ref - ini > 10:
+        subida = df["Close"].iloc[ref] > df["Close"].iloc[ini]
+        ema_ordenada = df["EMA21"].iloc[ref] > df["EMA50"].iloc[ref]
+        ema_subiendo = df["EMA50"].iloc[ref] > df["EMA50"].iloc[max(0, ref - 20)]
+        tendencia_alcista = bool(subida and ema_ordenada and ema_subiendo)
+
+    resist_prev = None
+    testeo = False
+    zona_previa = df["High"].iloc[:max(0, ref - 15)]
+    if len(zona_previa) > 20:
+        resist_prev = float(zona_previa.max())
+        precio_pico = float(df["High"].iloc[ref])
+        testeo = abs(precio_pico - resist_prev) / resist_prev <= TOL_RESISTENCIA
+        res["lineas"]["resistencia"] = resist_prev
+
+    res["c1"] = bool(tendencia_alcista and testeo)
+    res["detalle"]["c1"] = (
+        f"Tendencia previa alcista: {'sí' if tendencia_alcista else 'no'} | "
+        f"Resistencia relevante previa: "
+        f"{('%.4f' % resist_prev) if resist_prev else 'no localizada'} | "
+        f"Testeo/dilatación: {'sí' if testeo else 'no'}"
+    )
+
+    # ---------------- CIRCUNSTANCIA 3: lateral plano junto a las EMAs ------
+    tramo = df.iloc[-BARRAS_LATERAL:]
+    rango = float(tramo["High"].max() - tramo["Low"].min())
+    lateral = bool(rango <= FACTOR_ATR_LATERAL * atr)
+    e21, e50 = float(df["EMA21"].iloc[-1]), float(df["EMA50"].iloc[-1])
+    cerca = bool(min(abs(cierre - e21), abs(cierre - e50)) / cierre <= PROX_EMA)
+    bajo_ema = bool(cierre < e21 or cierre < e50)
+
+    res["c3"] = bool(lateral and cerca)
+    res["detalle"]["c3"] = (
+        f"Rango últimas {BARRAS_LATERAL} barras: {rango:.4f} (ATR {atr:.4f}) | "
+        f"Consolidación plana: {'sí' if lateral else 'no'} | "
+        f"Pegado a EMA21/EMA50: {'sí' if cerca else 'no'} | "
+        f"Precio bajo las EMAs: {'sí' if bajo_ema else 'no'}"
+    )
+
+    # ---------------- NIVELES OPERATIVOS (corto) --------------------------
+    ventana_max = df["High"].iloc[-BARRAS_LATERAL:].max()
+    if pico2 is not None:
+        ventana_max = max(ventana_max, df["High"].iloc[pico2])
+    stop = float(ventana_max) + MARGEN_STOP_ATR * atr
+    entrada = cierre
+    riesgo = stop - entrada
+    res["niveles"] = {
+        "entrada": entrada,
+        "stop": stop,
+        "riesgo": riesgo,
+        "obj2": entrada - 2 * riesgo,
+        "obj3": entrada - 3 * riesgo,
+        "atr": atr,
+    }
+    return res, df
+
+
+# --------------------------------------------------------------------------
+# GRÁFICO
+# --------------------------------------------------------------------------
+def graficar(df, res, ticker, intervalo):
+    x = df["Fecha"] if "Fecha" in df.columns else df.index
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(x=x, open=df["Open"], high=df["High"],
+                                 low=df["Low"], close=df["Close"], name="Precio"))
+    fig.add_trace(go.Scatter(x=x, y=df["EMA21"], line=dict(color="royalblue", width=1.6), name="EMA 21"))
+    fig.add_trace(go.Scatter(x=x, y=df["EMA50"], line=dict(color="orange", width=1.6), name="EMA 50"))
+
+    L = res["lineas"]
+    if "resistencia" in L:
+        fig.add_hline(y=L["resistencia"], line=dict(color="red", dash="dash", width=1.2),
+                      annotation_text="Resistencia previa", annotation_position="top left")
+    if "valle" in L:
+        fig.add_hline(y=L["valle"][1], line=dict(color="magenta", dash="dot", width=1.2),
+                      annotation_text="Valle del doble techo", annotation_position="bottom left")
+    if "picos" in L:
+        i1, y1, i2, y2 = L["picos"]
+        fig.add_trace(go.Scatter(x=[x.iloc[i1], x.iloc[i2]], y=[y1, y2], mode="markers+lines",
+                                 marker=dict(color="red", size=11, symbol="triangle-down"),
+                                 line=dict(color="red", width=1, dash="dot"), name="Doble techo"))
+    if "directriz" in L:
+        m1, ya, m2, yb = L["directriz"]
+        fin = len(df) - 1
+        fig.add_trace(go.Scatter(x=[x.iloc[m1], x.iloc[fin]],
+                                 y=[ya, recta(m1, ya, m2, yb, fin)],
+                                 line=dict(color="lime", width=1.6), name="Directriz alcista"))
+
+    nv = res["niveles"]
+    fig.add_hline(y=nv["stop"], line=dict(color="crimson", width=1),
+                  annotation_text="STOP", annotation_position="right")
+    fig.add_hline(y=nv["obj2"], line=dict(color="seagreen", width=1),
+                  annotation_text="Objetivo 1:2", annotation_position="right")
+    fig.add_hline(y=nv["obj3"], line=dict(color="darkgreen", width=1),
+                  annotation_text="Objetivo 1:3", annotation_position="right")
+
+    fig.update_layout(title=f"{ticker} — {intervalo} — Pauta de Techo Corto",
+                      xaxis_rangeslider_visible=False, template="plotly_dark",
+                      height=650, margin=dict(l=40, r=90, t=60, b=40))
+    fig.show()
+
+
+# --------------------------------------------------------------------------
+# INTERFAZ
+# --------------------------------------------------------------------------
+w_ticker = widgets.Combobox(
+    value="USDJPY=X",
+    options=["USDJPY=X", "NQ=F", "ES=F", "AAPL", "EURUSD=X", "GC=F", "^GSPC", "SAN.MC"],
+    description="Activo:", ensure_option=False,
+    layout=widgets.Layout(width="340px"))
+
+w_tf = widgets.Dropdown(options=[("Diaria (1d)", "1d"), ("Intradía (1h)", "1h")],
+                        value="1d", description="Temporalidad:",
+                        style={"description_width": "110px"},
+                        layout=widgets.Layout(width="340px"))
+
+w_btn = widgets.Button(description="Analizar Gráfico", button_style="primary",
+                       icon="line-chart", layout=widgets.Layout(width="200px"))
+w_out = widgets.Output()
+
+
+def on_click(_):
+    with w_out:
+        clear_output(wait=True)
+        ticker = w_ticker.value.strip()
+        intervalo = w_tf.value
+        print(f"Descargando {ticker} ({intervalo})...")
+        df = descargar(ticker, intervalo)
+        if df is None or len(df) < 80:
+            print("No se han obtenido datos suficientes. Revisa el símbolo (formato Yahoo Finance).")
+            return
+        res, df = analizar(df)
+        clear_output(wait=True)
+
+        ok = lambda b: "🟢" if b else "🔴"
+        nv = res["niveles"]
+        cumplidas = sum([res["c1"], res["c2"], res["c3"]])
+
+        print("=" * 74)
+        print(f"  PAUTA DE TECHO CORTO — {ticker} ({intervalo})   |   Cierre: {nv['entrada']:.4f}")
+        print("=" * 74)
+        print(f"{ok(res['c1'])} CIRCUNSTANCIA 1 — Tendencia alcista previa y testeo/dilatación de resistencia")
+        print(f"     {res['detalle']['c1']}")
+        print(f"{ok(res['c2'])} CIRCUNSTANCIA 2 — Doble techo, ruptura del valle y perforación de la directriz")
+        print(f"     {res['detalle']['c2']}")
+        print(f"{ok(res['c3'])} CIRCUNSTANCIA 3 — Consolidación plana junto a EMA21/EMA50")
+        print(f"     {res['detalle']['c3']}")
+        print("-" * 74)
+        print(f"  CIRCUNSTANCIAS CUMPLIDAS: {cumplidas}/3")
+        if cumplidas == 3:
+            print("  >> Pauta completa. Vigilar el giro a la baja desde la consolidación.")
+        elif cumplidas == 2:
+            print("  >> Pauta incompleta. En formación: esperar confirmación de la que falta.")
+        else:
+            print("  >> Sin pauta. No operar por este criterio.")
+        print("-" * 74)
+        print("  NIVELES ORIENTATIVOS (posición corta)")
+        print(f"    Entrada (cierre actual) : {nv['entrada']:.4f}")
+        print(f"    Stop Loss (máx + 0.5ATR): {nv['stop']:.4f}   (riesgo {nv['riesgo']:.4f})")
+        print(f"    Objetivo 1:2            : {nv['obj2']:.4f}")
+        print(f"    Objetivo 1:3            : {nv['obj3']:.4f}")
+        print(f"    ATR(14)                 : {nv['atr']:.4f}")
+        print("=" * 74)
+        graficar(df, res, ticker, intervalo)
+
+
+w_btn.on_click(on_click)
+display(widgets.VBox([w_ticker, w_tf, w_btn, w_out]))
